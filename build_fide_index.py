@@ -21,7 +21,7 @@ SHARDS = 4096                    # players are grouped into this many files
 PLIES = 30                       # opening moves kept per game (15 moves each side); the full game is on Lichess
 FLUSH_EVERY = 200_000            # lines buffered in memory before they're written to the scratch folder
 UA = "fox-chess-data/1 (+https://github.com/Batancr/fox-chess-data)"
-VERSION = 2
+VERSION = 3
 
 def log(*a):
     print(*a, flush=True)
@@ -122,23 +122,42 @@ def sans(movetext, limit):
     toks = [x for x in toks if x]
     return toks[:limit], len(toks)
 
+MOVE_COUNTS = {20, 30, 36, 40, 50, 60}
+
+def tc_seconds(tc):
+    """(starting seconds, increment seconds) from a broadcast's TimeControl, or None. Broadcasts write it many ways:
+    '5400+30', '40/5400+30:1800+30', '90+30' (minutes), "3'+2''", '90min/40 moves + 30min + 30s/move',
+    '100 minutes/40 moves + 40 minutes/rest with 30 seconds increment', 'G/90; +30', '1:30:30' (h:mm:ss) ..."""
+    t = (tc or "").lower().replace("’", "'").replace("”", '"').replace("''", '"').replace("“", '"')
+    m = re.fullmatch(r"\s*(\d):(\d\d)(?::(\d\d))?\s*", t)
+    if m:                                                  # 1:30:30 = 1 h 30 min, 30 s increment
+        return int(m.group(1)) * 3600 + int(m.group(2)) * 60, int(m.group(3) or 0)
+    t = re.split(r"\(|\s/\s|(?<=\d):(?=\d)", t)[0]          # drop alternatives and later time periods
+    t = re.sub(r"(\d+)\s*/\s*(\d+)(?!\s*(?:min|h|'))",       # '40/90', '90/40', '5400/40': drop the move count
+               lambda m: m.group(1) if int(m.group(2)) in MOVE_COUNTS else m.group(2) if int(m.group(1)) in MOVE_COUNTS else m.group(1), t)
+    t = re.sub(r"/\s*\d+\s*(?:moves?|mv\b|m\b)|\d+\s*(?:moves?|mv\b)", " ", t)   # '40 moves', '/40m' (but '45m' is minutes)
+    t = re.sub(r"\bx\s*\d+", " ", t)                        # "90' x 40"
+    t = re.sub(r"(?:from\s+)?move\s*(?:\d+|one)", " ", t)  # 'from move 1'
+    base = inc = None
+    for mt in re.finditer(r"(\+)?\s*(\d+)\s*(hours?|hrs?|h\b|minutes?|mins?|min\b\.?|m\b|'|seconds?|secs?|sec\b\.?|segs?|seg\b|s\b|\")?", t):
+        n, u, plus = int(mt.group(2)), (mt.group(3) or "").rstrip("."), bool(mt.group(1))
+        if base is None:
+            base = n * 3600 if u[:1] == "h" else n * 60 if (u[:1] == "m" or u == "'") else n if u else (n * 60 if n <= 150 else n)
+            continue
+        if u in ("s", '"') or u.startswith("sec") or u.startswith("seg"):
+            inc = n
+            break
+        if not u and plus and inc is None:
+            inc = n                                          # '90+30': a bare number after + is the increment
+    return (base, inc or 0) if base else None
+
 def speed(tc, event=""):
-    """Lichess's speed classes (b bullet, z blitz, r rapid, c classical) from a PGN TimeControl.
-    Broadcasts write it in seconds ('5400+30', '40/5400+30:1800+30') or in minutes ('90+30', '15+10');
-    a starting time of 150 or less is read as minutes, since no over-the-board game starts with under 2.5 minutes.
-    Without a usable TimeControl, the event's name decides ('... Rapid', '... Blitz')."""
-    t = (tc or "").strip().lower()
-    if t and t not in ("-", "?"):
-        first = re.split(r"[:,;]", t)[0]
-        if "/" in first:
-            first = first.split("/")[-1]
-        m = re.search(r"(\d+)\s*(min|m|')?\s*(?:\+\s*(\d+))?", first)
-        if m:
-            base, inc = int(m.group(1)), int(m.group(3) or 0)
-            if m.group(2) or base <= 150:
-                base *= 60
-            est = base + 40 * inc
-            return "u" if est < 30 else "b" if est < 180 else "z" if est < 480 else "r" if est < 1500 else "c"
+    """Lichess's speed classes (b bullet, z blitz, r rapid, c classical) from the TimeControl: starting time plus
+    40 times the increment. Without a usable TimeControl, the event's name decides ('... Rapid', '... Blitz')."""
+    r = tc_seconds(tc)
+    if r:
+        est = r[0] + 40 * r[1]
+        return "u" if est < 30 else "b" if est < 180 else "z" if est < 480 else "r" if est < 1500 else "c"
     e = (event or "").lower()
     bl, ra = "blitz" in e, "rapid" in e
     if bl != ra:
@@ -146,6 +165,14 @@ def speed(tc, event=""):
     if not bl and re.search(r"classical|standard", e):
         return "c"
     return ""
+
+ONLINE = re.compile(r"\bonline\b|chess\.com|chess24|titled (?:tuesday|arena)|magnus (?:carlsen )?invitational|lindores abbey|"
+                    r"chessable masters|airthings masters|opera euro rapid|new in chess classic|"
+                    r"goldmoney asian|skilling open|speed chess championship|pro chess league|bullet chess championship", re.I)
+
+def looks_online(event):
+    """Some 2020-2021 broadcasts relayed online events; these are marked so the site can leave them out."""
+    return 1 if ONLINE.search(event or "") else 0
 
 def tc_shape(tc):
     return re.sub(r"\d+", "N", (tc or "").strip())[:40] or "(none)"
@@ -255,7 +282,7 @@ def read_month(path, month, scratch, removed, names, noid, tcs):
             tcs[(tc_shape(h.get("TimeControl", "")), sp)][0] += 1
             tcs[(tc_shape(h.get("TimeControl", "")), sp)][1] = h.get("TimeControl", "")
             base = {"d": date_num(h, month), "s": sp, "n": n, "m": " ".join(mv),
-                    "rp": rnd, "rn": event, "g": gid, "eco": h.get("ECO", ""), "x": 0}
+                    "rp": rnd, "rn": event, "g": gid, "eco": h.get("ECO", ""), "x": 0, "on": looks_online(event)}
             for me, them, c in (("White", "Black", "w"), ("Black", "White", "b")):
                 fid = wf if c == "w" else bf
                 g = dict(base, c=c, r=res[0] if c == "w" else res[1],
@@ -308,7 +335,7 @@ def load_shard(path):
             r = rounds[x[8]] if 0 <= x[8] < len(rounds) else ["", ""]
             gl.append({"g": x[0], "d": x[1], "c": x[2], "r": x[3], "o": x[4], "of": x[5], "oe": x[6], "e": x[7],
                        "rn": r[0], "rp": r[1], "s": x[9], "n": x[10], "m": x[11], "eco": x[12] if len(x) > 12 else "",
-                       "x": x[13] if len(x) > 13 else 0})
+                       "x": x[13] if len(x) > 13 else 0, "on": x[14] if len(x) > 14 else 0})
         players[int(fid)] = {"name": p.get("name", "?"), "title": p.get("title", ""), "seen": p.get("seen", 0), "games": gl}
     return players
 
@@ -322,7 +349,7 @@ def save_shard(path, players):
             if key not in ridx:
                 ridx[key] = len(rounds)
                 rounds.append([g["rn"], g["rp"]])
-            rows.append([g["g"], g["d"], g["c"], g["r"], g["o"], g["of"], g["oe"], g["e"], ridx[key], g["s"], g["n"], g["m"], g["eco"], g.get("x", 0)])
+            rows.append([g["g"], g["d"], g["c"], g["r"], g["o"], g["of"], g["oe"], g["e"], ridx[key], g["s"], g["n"], g["m"], g["eco"], g.get("x", 0), g.get("on", 0)])
         out[str(fid)] = {"name": p["name"], "title": p["title"], "seen": p["seen"], "games": rows}
     body = json.dumps({"v": VERSION, "rounds": rounds, "players": out}, ensure_ascii=False, separators=(",", ":")).encode("utf8")
     with open(path, "wb") as raw:
@@ -481,7 +508,7 @@ def main():
             "format": "p/XYZ.json.gz: XYZ = FIDE ID % 4096 in 3 hex digits. players[id].games rows: "
                       "[gameId, yyyymmdd, colour, result, opponent, opponentFideId, opponentElo, ownElo, roundIndex, "
                       "speed (b bullet, z blitz, r rapid, c classical, '' unknown), plies, first moves, ECO, "
-                      "1 if placed by the player's name (the game had no FIDE ID for them) else 0]; "
+                      "1 if placed by the player's name (the game had no FIDE ID for them) else 0, 1 if the event looks online else 0]; "
                       "rounds[i] = [event name, 'tour-slug/round-slug/roundId'] -> https://lichess.org/broadcast/<that>/<gameId>"}
     with open(os.path.join(a.out, "meta.json"), "w", encoding="utf8") as f:
         json.dump(meta, f, indent=1)

@@ -15,6 +15,10 @@ newer game) are placed by the player's **name**, using the names seen next to FI
 when that name belongs to exactly one FIDE ID. Those games are marked as placed by name (the last field of each
 game is 1), so the site can say so. `names.json.gz` holds the names learnt.
 
+Some 2020–2021 broadcasts relayed **online** events (for example the Magnus Carlsen Invitational). Games from events
+whose name looks online are kept but marked (the field after the "placed by name" one is 1), so the site can leave
+them out of over-the-board results.
+
 ## How it runs
 
 `.github/workflows/build.yml` runs on GitHub's computers (free for public repos), never on your own:
