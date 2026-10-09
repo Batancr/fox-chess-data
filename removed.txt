@@ -1,0 +1,2 @@
+# FIDE IDs to leave out of the published files, one per line (anything after # is ignored).
+# Add an ID here when someone asks to be removed; the next run takes them out.

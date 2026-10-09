@@ -1,0 +1,87 @@
+# Builds the FIDE game files and publishes them on GitHub Pages (branch gh-pages).
+# Runs by itself on the 9th of each month, adding the month Lichess has just published.
+# To run it by hand: Actions tab -> "Build FIDE game files" -> Run workflow (choose "full" to rebuild everything).
+name: Build FIDE game files
+
+on:
+  schedule:
+    - cron: "23 7 9 * *"          # 07:23 UTC on the 9th of each month
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "update = add months not in yet; full = rebuild everything from 2020"
+        type: choice
+        options: [update, full]
+        default: update
+
+permissions:
+  contents: write                 # push the gh-pages branch and the status file
+  pages: write                    # ask GitHub Pages to rebuild
+
+concurrency:
+  group: build-fide
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the one extra package
+        run: pip install zstandard
+
+      - name: Get the files published last time
+        run: |
+          mkdir -p prev
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch --quiet --depth 1 origin gh-pages
+            git archive FETCH_HEAD | tar -x -C prev
+            echo "Found the last published files."
+          else
+            echo "Nothing published yet; this run builds everything."
+          fi
+
+      - name: Build
+        env:
+          MODE: ${{ github.event.inputs.mode || 'update' }}
+        run: python build_fide_index.py --mode "$MODE" --prev prev --out out --removed removed.txt
+
+      - name: Publish as one fresh commit (so the repo never grows)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd out
+          git init --quiet -b gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit --quiet -m "FIDE game files, $(date -u +%Y-%m-%d)"
+          git push --quiet --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
+
+      - name: Ask GitHub Pages to rebuild
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -sS -X POST -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pages/builds" || true
+
+      - name: Record the run on the main branch (keeps the monthly schedule switched on)
+        run: |
+          python - <<'PY'
+          import json
+          m = json.load(open("out/meta.json"))
+          keep = {k: m[k] for k in ("built", "players", "entries", "bytes")}
+          keep["months"] = [m["months"][0], m["months"][-1]] if m["months"] else []
+          json.dump(keep, open("status.json", "w"), indent=1)
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add status.json
+          git diff --cached --quiet || (git commit --quiet -m "Status after the build [skip ci]" && git push --quiet)
