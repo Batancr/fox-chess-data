@@ -14,14 +14,14 @@ Output (the folder published on GitHub Pages):
 
 Needs Python 3.9+ and the "zstandard" package (pip install zstandard).
 """
-import argparse, gzip, hashlib, json, os, re, shutil, sys, tempfile, time, urllib.request
+import argparse, collections, gzip, hashlib, json, os, re, shutil, sys, tempfile, time, unicodedata, urllib.request
 
 BASE = "https://database.lichess.org/broadcast/"
 SHARDS = 4096                    # players are grouped into this many files
 PLIES = 30                       # opening moves kept per game (15 moves each side); the full game is on Lichess
 FLUSH_EVERY = 200_000            # lines buffered in memory before they're written to the scratch folder
 UA = "fox-chess-data/1 (+https://github.com/Batancr/fox-chess-data)"
-VERSION = 1
+VERSION = 2
 
 def log(*a):
     print(*a, flush=True)
@@ -122,18 +122,40 @@ def sans(movetext, limit):
     toks = [x for x in toks if x]
     return toks[:limit], len(toks)
 
-def speed(tc):
-    """Lichess's speed classes from a PGN TimeControl like '5400+30' or '40/5400+30:1800+30'."""
-    if not tc:
-        return ""
-    first = tc.split(":")[0]
-    if "/" in first:
-        first = first.split("/")[-1]
-    m = re.match(r"^(\d+)(?:\+(\d+))?", first)
-    if not m:
-        return ""
-    est = int(m.group(1)) + 40 * int(m.group(2) or 0)
-    return "u" if est < 30 else "b" if est < 180 else "z" if est < 480 else "r" if est < 1500 else "c"   # z = blitz
+def speed(tc, event=""):
+    """Lichess's speed classes (b bullet, z blitz, r rapid, c classical) from a PGN TimeControl.
+    Broadcasts write it in seconds ('5400+30', '40/5400+30:1800+30') or in minutes ('90+30', '15+10');
+    a starting time of 150 or less is read as minutes, since no over-the-board game starts with under 2.5 minutes.
+    Without a usable TimeControl, the event's name decides ('... Rapid', '... Blitz')."""
+    t = (tc or "").strip().lower()
+    if t and t not in ("-", "?"):
+        first = re.split(r"[:,;]", t)[0]
+        if "/" in first:
+            first = first.split("/")[-1]
+        m = re.search(r"(\d+)\s*(min|m|')?\s*(?:\+\s*(\d+))?", first)
+        if m:
+            base, inc = int(m.group(1)), int(m.group(3) or 0)
+            if m.group(2) or base <= 150:
+                base *= 60
+            est = base + 40 * inc
+            return "u" if est < 30 else "b" if est < 180 else "z" if est < 480 else "r" if est < 1500 else "c"
+    e = (event or "").lower()
+    bl, ra = "blitz" in e, "rapid" in e
+    if bl != ra:
+        return "z" if bl else "r"
+    if not bl and re.search(r"classical|standard", e):
+        return "c"
+    return ""
+
+def tc_shape(tc):
+    return re.sub(r"\d+", "N", (tc or "").strip())[:40] or "(none)"
+
+def norm_name(s):
+    """'Carlsen, Magnus', 'Magnus Carlsen' and 'CARLSEN Magnus' all become 'carlsen magnus'. Needs two name parts."""
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(ch for ch in s if not unicodedata.combining(ch)).lower()
+    toks = sorted(re.findall(r"[^\W\d_]+", s))
+    return " ".join(toks) if len(toks) >= 2 and sum(len(x) > 1 for x in toks) >= 2 else ""
 
 def fide(v):
     v = (v or "").strip()
@@ -143,12 +165,14 @@ def elo(v):
     v = (v or "").strip()
     return int(v) if v.isdigit() else 0
 
-def date_num(h):
+def date_num(h, month=""):
     for k in ("UTCDate", "Date"):
         d = h.get(k, "")
         m = re.match(r"^(\d{4})\.(\d{2})\.(\d{2})", d)
         if m and "?" not in d:
             return int(m.group(1) + m.group(2) + m.group(3))
+    if month:                                   # no usable date: the month of the file it came from (day 00)
+        return int(month.replace("-", "")) * 100
     m = re.match(r"^(\d{4})", h.get("Date", ""))
     return int(m.group(1)) * 10000 if m else 0
 
@@ -183,10 +207,33 @@ class Scratch:
                 f.write("\n".join(lines) + "\n")
         self.buf, self.n = {}, 0
 
-def read_month(path, scratch, removed):
+class Names:
+    """Which FIDE ID each player name belongs to, learnt from games that carry FIDE IDs (Lichess added them to
+    broadcasts in 2023). Used to place older games that have names but no IDs, only when a name means exactly one ID."""
+    def __init__(self):
+        self.ids = collections.defaultdict(set)
+    def learn(self, name, fid):
+        k = norm_name(name)
+        if k:
+            self.ids[k].add(fid)
+    def find(self, name):
+        s = self.ids.get(norm_name(name))
+        return next(iter(s)) if s and len(s) == 1 else 0
+    def load(self, path):
+        if os.path.exists(path):
+            with gzip.open(path, "rt", encoding="utf8") as f:
+                for k, v in json.load(f).items():
+                    self.ids[k].update(v)
+    def save(self, path):
+        body = json.dumps({k: sorted(v) for k, v in sorted(self.ids.items())}, ensure_ascii=False, separators=(",", ":")).encode("utf8")
+        with open(path, "wb") as raw:
+            with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, compresslevel=9) as f:
+                f.write(body)
+
+def read_month(path, month, scratch, removed, names, noid, tcs):
     import zstandard   # imported here so --help works without it
     import io
-    kept = skipped = 0
+    kept = waiting = skipped = 0
     with open(path, "rb") as fh:
         reader = zstandard.ZstdDecompressor().stream_reader(fh)
         text = io.TextIOWrapper(reader, encoding="utf8", errors="replace")
@@ -197,28 +244,53 @@ def read_month(path, scratch, removed):
                     or "BOT" in (h.get("WhiteTitle", ""), h.get("BlackTitle", ""))):
                 skipped += 1
                 continue
-            wf, bf = fide(h.get("WhiteFideId")), fide(h.get("BlackFideId"))
-            if not wf and not bf:
-                skipped += 1
-                continue
             mv, n = sans(mt, PLIES)
             if not mv:
                 skipped += 1
                 continue
+            wf, bf = fide(h.get("WhiteFideId")), fide(h.get("BlackFideId"))
             rnd, gid = round_and_game(h)
             event = h.get("BroadcastName") or h.get("Event") or ""
-            base = {"d": date_num(h), "s": speed(h.get("TimeControl", "")), "n": n, "m": " ".join(mv),
-                    "rp": rnd, "rn": event, "g": gid, "eco": h.get("ECO", "")}
+            sp = speed(h.get("TimeControl", ""), event)
+            tcs[(tc_shape(h.get("TimeControl", "")), sp)][0] += 1
+            tcs[(tc_shape(h.get("TimeControl", "")), sp)][1] = h.get("TimeControl", "")
+            base = {"d": date_num(h, month), "s": sp, "n": n, "m": " ".join(mv),
+                    "rp": rnd, "rn": event, "g": gid, "eco": h.get("ECO", ""), "x": 0}
             for me, them, c in (("White", "Black", "w"), ("Black", "White", "b")):
                 fid = wf if c == "w" else bf
-                if not fid or fid in removed:
-                    continue
                 g = dict(base, c=c, r=res[0] if c == "w" else res[1],
                          o=h.get(them, "?"), of=bf if c == "w" else wf, oe=elo(h.get(them + "Elo")),
                          e=elo(h.get(me + "Elo")))
-                scratch.add(shard_of(fid), json.dumps([fid, h.get(me, "?"), h.get(me + "Title", ""), g], ensure_ascii=False, separators=(",", ":")))
-            kept += 1
-    return kept, skipped
+                if fid:
+                    names.learn(h.get(me, ""), fid)
+                    if fid not in removed:
+                        scratch.add(shard_of(fid), json.dumps([fid, h.get(me, "?"), h.get(me + "Title", ""), g], ensure_ascii=False, separators=(",", ":")))
+                else:                                       # no FIDE ID on this side: try its name once every month is read
+                    noid.write(json.dumps([h.get(me, ""), h.get(me + "Title", ""), g], ensure_ascii=False, separators=(",", ":")) + "\n")
+            if wf or bf:
+                kept += 1
+            else:
+                waiting += 1
+    return kept, waiting, skipped
+
+def place_by_name(noid_path, scratch, removed, names):
+    """Games (or sides) without a FIDE ID, placed by name where the name belongs to exactly one FIDE ID."""
+    placed = left = 0
+    if not os.path.exists(noid_path):
+        return 0, 0
+    with open(noid_path, encoding="utf8") as f:
+        for line in f:
+            name, title, g = json.loads(line)
+            fid = names.find(name)
+            if not fid or fid in removed:
+                left += 1
+                continue
+            if not g["of"]:
+                g["of"] = names.find(g["o"])
+            g["x"] = 1
+            scratch.add(shard_of(fid), json.dumps([fid, name, title, g], ensure_ascii=False, separators=(",", ":")))
+            placed += 1
+    return placed, left
 
 # ---------------------------------------------------------------- merging into the published files
 # a game in a published file: [gameId, yyyymmdd, colour, result, opponent, opponentFideId, opponentElo, ownElo,
@@ -235,7 +307,8 @@ def load_shard(path):
         for x in p["games"]:
             r = rounds[x[8]] if 0 <= x[8] < len(rounds) else ["", ""]
             gl.append({"g": x[0], "d": x[1], "c": x[2], "r": x[3], "o": x[4], "of": x[5], "oe": x[6], "e": x[7],
-                       "rn": r[0], "rp": r[1], "s": x[9], "n": x[10], "m": x[11], "eco": x[12] if len(x) > 12 else ""})
+                       "rn": r[0], "rp": r[1], "s": x[9], "n": x[10], "m": x[11], "eco": x[12] if len(x) > 12 else "",
+                       "x": x[13] if len(x) > 13 else 0})
         players[int(fid)] = {"name": p.get("name", "?"), "title": p.get("title", ""), "seen": p.get("seen", 0), "games": gl}
     return players
 
@@ -249,7 +322,7 @@ def save_shard(path, players):
             if key not in ridx:
                 ridx[key] = len(rounds)
                 rounds.append([g["rn"], g["rp"]])
-            rows.append([g["g"], g["d"], g["c"], g["r"], g["o"], g["of"], g["oe"], g["e"], ridx[key], g["s"], g["n"], g["m"], g["eco"]])
+            rows.append([g["g"], g["d"], g["c"], g["r"], g["o"], g["of"], g["oe"], g["e"], ridx[key], g["s"], g["n"], g["m"], g["eco"], g.get("x", 0)])
         out[str(fid)] = {"name": p["name"], "title": p["title"], "seen": p["seen"], "games": rows}
     body = json.dumps({"v": VERSION, "rounds": rounds, "players": out}, ensure_ascii=False, separators=(",", ":")).encode("utf8")
     with open(path, "wb") as raw:
@@ -272,7 +345,7 @@ def merge_shard(shard, prev_dir, out_dir, scratch_dir, removed):
                     continue
                 fid, name, title, g = json.loads(line)
                 p = players.setdefault(fid, {"name": name, "title": title, "seen": 0, "games": []})
-                if g["d"] >= p["seen"]:                     # keep the name and title from their latest game
+                if not g.get("x") and g["d"] >= p["seen"]:  # keep the name and title from their latest game with a FIDE ID
                     p["name"], p["title"], p["seen"] = name, title, g["d"]
                 p["games"].append(g)
     for fid in list(players):
@@ -280,7 +353,7 @@ def merge_shard(shard, prev_dir, out_dir, scratch_dir, removed):
             del players[fid]
             continue
         seen, gl = set(), []
-        for g in sorted(players[fid]["games"], key=lambda g: (-g["d"], g["rp"], g["g"])):
+        for g in sorted(players[fid]["games"], key=lambda g: (-g["d"], g["rp"], g["g"], g.get("x", 0))):
             k = game_key(g)
             if k not in seen:
                 seen.add(k)
@@ -347,8 +420,15 @@ def main():
     os.makedirs(os.path.join(a.out, "p"), exist_ok=True)
     work = a.work or tempfile.mkdtemp(prefix="fide-")
     scratch = Scratch(os.path.join(work, "scratch"))
+    names = Names()
+    if prev:
+        names.load(os.path.join(prev, "names.json.gz"))
+    noid_path = os.path.join(work, "noid.jsonl")
+    noid = open(noid_path, "w", encoding="utf8")
+    tcs = collections.defaultdict(lambda: [0, ""])
     sums = checksums(base) if months else {}
     stats = dict(prev_meta.get("month_games", {}))
+    nostats = dict(prev_meta.get("month_no_id", {}))
     for i, m in enumerate(months):
         name = f"lichess_db_broadcast_{m}.pgn.zst"
         dest = os.path.join(work, name)
@@ -358,12 +438,17 @@ def main():
         size = os.path.getsize(dest)
         if name in sums and sha256(dest) != sums[name]:
             raise SystemExit(f"{name}: the checksum doesn't match Lichess's list. Stopping so nothing wrong is published.")
-        kept, skipped = read_month(dest, scratch, removed)
+        kept, waiting, skipped = read_month(dest, m, scratch, removed, names, noid, tcs)
         os.remove(dest)
-        stats[m] = kept
-        log(f"    {size / 1e6:.1f} MB, {kept:,} games with a FIDE ID kept, {skipped:,} left out, {time.time() - t1:.0f}s")
+        stats[m], nostats[m] = kept, waiting
+        log(f"    {size / 1e6:.1f} MB: {kept:,} games with a FIDE ID, {waiting:,} without (placed by name later if possible), "
+            f"{skipped:,} left out, {time.time() - t1:.0f}s")
         if a.pause and i < len(months) - 1:
             time.sleep(a.pause)
+    noid.close()
+    placed, left = place_by_name(noid_path, scratch, removed, names)
+    if months:
+        log(f"Placed {placed:,} player-games without a FIDE ID by their name; {left:,} couldn't be (unknown or shared names).")
     scratch.flush()
 
     # copy last time's files, then rewrite only the groups that changed (new games, or a removed player)
@@ -383,16 +468,20 @@ def main():
         if k % 500 == 499:
             log(f"    {k + 1:,} files")
     shutil.rmtree(work, ignore_errors=True)
+    names.save(os.path.join(a.out, "names.json.gz"))
 
     size = sum(os.path.getsize(os.path.join(a.out, "p", f)) for f in os.listdir(os.path.join(a.out, "p")))
     meta = {"version": VERSION, "shards": SHARDS, "plies": PLIES, "source": base,
             "built": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "months": sorted(done | set(months)), "month_games": stats,
+            "months": sorted(done | set(months)), "month_games": stats, "month_no_id": nostats,
+            "placed_by_name": prev_meta.get("placed_by_name", 0) + placed,
+            "tc_formats": [[k[0], k[1], v[0], v[1]] for k, v in sorted(tcs.items(), key=lambda x: -x[1][0])[:60]] or prev_meta.get("tc_formats", []),
             "players": sum(c[0] for c in counts.values()), "entries": sum(c[1] for c in counts.values()),
             "bytes": size, "counts": counts,
             "format": "p/XYZ.json.gz: XYZ = FIDE ID % 4096 in 3 hex digits. players[id].games rows: "
                       "[gameId, yyyymmdd, colour, result, opponent, opponentFideId, opponentElo, ownElo, roundIndex, "
-                      "speed (b bullet, z blitz, r rapid, c classical), plies, first moves, ECO]; "
+                      "speed (b bullet, z blitz, r rapid, c classical, '' unknown), plies, first moves, ECO, "
+                      "1 if placed by the player's name (the game had no FIDE ID for them) else 0]; "
                       "rounds[i] = [event name, 'tour-slug/round-slug/roundId'] -> https://lichess.org/broadcast/<that>/<gameId>"}
     with open(os.path.join(a.out, "meta.json"), "w", encoding="utf8") as f:
         json.dump(meta, f, indent=1)

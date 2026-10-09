@@ -10,6 +10,11 @@ The [Lichess open database](https://database.lichess.org/#broadcasts) publishes 
 with both players' FIDE IDs in the headers. Those files are released under **CC0** ("use them for anything you
 like"), so they can be republished here. Coverage is only events broadcast on Lichess, from January 2020.
 
+Lichess only started putting FIDE IDs on broadcast games in 2023. Older games (and players without an ID in a
+newer game) are placed by the player's **name**, using the names seen next to FIDE IDs in later games, and only
+when that name belongs to exactly one FIDE ID. Those games are marked as placed by name (the last field of each
+game is 1), so the site can say so. `names.json.gz` holds the names learnt.
+
 ## How it runs
 
 `.github/workflows/build.yml` runs on GitHub's computers (free for public repos), never on your own:
