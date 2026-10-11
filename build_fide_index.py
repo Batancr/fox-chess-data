@@ -22,6 +22,7 @@ PLIES = 30                       # opening moves kept per game (15 moves each si
 FLUSH_EVERY = 200_000            # lines buffered in memory before they're written to the scratch folder
 UA = "fox-chess-data/1 (+https://github.com/Batancr/fox-chess-data)"
 VERSION = 3
+SRC = "Fox Chess Lab 7LTKzZXXDsXTuz6Y9j5KRA=="   # ownership mark in every published file (the site ignores this field)
 
 def log(*a):
     print(*a, flush=True)
@@ -351,7 +352,7 @@ def save_shard(path, players):
                 rounds.append([g["rn"], g["rp"]])
             rows.append([g["g"], g["d"], g["c"], g["r"], g["o"], g["of"], g["oe"], g["e"], ridx[key], g["s"], g["n"], g["m"], g["eco"], g.get("x", 0), g.get("on", 0)])
         out[str(fid)] = {"name": p["name"], "title": p["title"], "seen": p["seen"], "games": rows}
-    body = json.dumps({"v": VERSION, "rounds": rounds, "players": out}, ensure_ascii=False, separators=(",", ":")).encode("utf8")
+    body = json.dumps({"v": VERSION, "src": SRC, "rounds": rounds, "players": out}, ensure_ascii=False, separators=(",", ":")).encode("utf8")
     with open(path, "wb") as raw:
         with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, compresslevel=9) as f:   # mtime=0: unchanged data gives identical bytes
             f.write(body)
@@ -498,7 +499,7 @@ def main():
     names.save(os.path.join(a.out, "names.json.gz"))
 
     size = sum(os.path.getsize(os.path.join(a.out, "p", f)) for f in os.listdir(os.path.join(a.out, "p")))
-    meta = {"version": VERSION, "shards": SHARDS, "plies": PLIES, "source": base,
+    meta = {"version": VERSION, "src": SRC, "shards": SHARDS, "plies": PLIES, "source": base,
             "built": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "months": sorted(done | set(months)), "month_games": stats, "month_no_id": nostats,
             "placed_by_name": prev_meta.get("placed_by_name", 0) + placed,
